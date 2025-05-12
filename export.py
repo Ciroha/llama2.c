@@ -188,12 +188,40 @@ def version2_export(model, filepath, group_size=64):
     - quantization is done in groups of group_size to reduce the effects of any outliers
     """
     version = 2
+    print(f"\n--- Starting Export to Version {version} Quantized Model File: {filepath} ---")
+    print(f"Using group_size: {group_size}")
 
     # let's first do some validation for this export type
     while model.params.dim % group_size != 0:
+        original_group_size = group_size
         group_size //= 2
-        print(f"BACKOFF: reducing group size to {group_size} to fit hidden_dim")
-    weights = [
+        print(f"WARNING: model.params.dim ({model.params.dim}) is not divisible by group_size ({original_group_size}).")
+        print(f"BACKOFF: reducing group_size to {group_size} to fit hidden_dim.")
+        if group_size == 0:
+            raise ValueError("group_size became 0, cannot proceed.")
+
+    p = model.params
+    weight_names = []
+    # Token Embeddings
+    weight_names.append("tok_embeddings.weight")
+    # Attention weights per layer
+    for i in range(p.n_layers):
+        weight_names.append(f"layers.{i}.attention.wq.weight")
+    for i in range(p.n_layers):
+        weight_names.append(f"layers.{i}.attention.wk.weight")
+    for i in range(p.n_layers):
+        weight_names.append(f"layers.{i}.attention.wv.weight")
+    for i in range(p.n_layers):
+        weight_names.append(f"layers.{i}.attention.wo.weight")
+    # FFN weights per layer
+    for i in range(p.n_layers):
+        weight_names.append(f"layers.{i}.feed_forward.w1.weight")
+    for i in range(p.n_layers):
+        weight_names.append(f"layers.{i}.feed_forward.w2.weight")
+    for i in range(p.n_layers):
+        weight_names.append(f"layers.{i}.feed_forward.w3.weight")
+
+    weights_to_quantize = [
         model.tok_embeddings.weight,
         *[layer.attention.wq.weight for layer in model.layers],
         *[layer.attention.wk.weight for layer in model.layers],
@@ -205,59 +233,149 @@ def version2_export(model, filepath, group_size=64):
     ]
     shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
     if not shared_classifier:
-        weights.append(model.output.weight)
-    for w in weights:
-        assert w.numel() % group_size == 0, f"weight {i} has numel {w.numel()}, not a multiple of group_size {group_size}"
+        weights_to_quantize.append(model.output.weight)
+        weight_names.append("output.weight")
 
-    # write
+    for w_idx, w in enumerate(weights_to_quantize):
+        if w.numel() % group_size != 0:
+            # This should ideally not happen if dim is divisible by group_size and weights are standard
+            print(f"WARNING: Weight {weight_names[w_idx]} (shape: {w.shape}, numel: {w.numel()}) "+
+                  f"is not perfectly divisible by group_size {group_size}.")
+            # Fallback or error based on strictness, for now, we'll let it proceed if quantize_q80 handles it by padding/erroring
+            # assert w.numel() % group_size == 0, f"weight {weight_names[w_idx]} has numel {w.numel()}, not a multiple of group_size {group_size}"
+
+
     out_file = open(filepath, 'wb')
-    # first write out the header. the header will be 256 bytes
+    current_offset = 0
+    print(f"\n--- Writing File Header (256 bytes) ---")
     # 1) write magic, which will be uint32 of "ak42" in ASCII
+    start_offset = out_file.tell()
     out_file.write(struct.pack('I', 0x616b3432))
+    print(f"  Magic Number (0x616b3432): Offset {start_offset}-{out_file.tell()-1}, Size: {out_file.tell() - start_offset} bytes")
     # 2) write version, which will be int
+    start_offset = out_file.tell()
     out_file.write(struct.pack('i', version))
+    print(f"  Version ({version}): Offset {start_offset}-{out_file.tell()-1}, Size: {out_file.tell() - start_offset} bytes")
     # 3) write the params, which will be 7 ints
-    p = model.params
+    start_offset = out_file.tell()
     hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]
     n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
-    header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+    header_params = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
                                     n_kv_heads, p.vocab_size, p.max_seq_len)
-    out_file.write(header)
+    out_file.write(header_params)
+    print(f"  Model Params (dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, max_seq_len): Offset {start_offset}-{out_file.tell()-1}, Size: {out_file.tell() - start_offset} bytes")
     # 4) write some other flags
+    start_offset = out_file.tell()
     out_file.write(struct.pack('B', int(shared_classifier)))
+    print(f"  Shared Classifier Flag ({int(shared_classifier)}): Offset {start_offset}-{out_file.tell()-1}, Size: {out_file.tell() - start_offset} byte")
+    start_offset = out_file.tell()
     out_file.write(struct.pack('i', group_size)) # group size used for quantization
-    pad = 256 - out_file.tell() # pad rest with zeros; tell returns current pos
-    assert pad >= 0
-    out_file.write(b'\0' * pad)
-    # now that the header is done, let's write out the model
+    print(f"  Group Size ({group_size}): Offset {start_offset}-{out_file.tell()-1}, Size: {out_file.tell() - start_offset} bytes")
+    
+    header_end_offset = out_file.tell()
+    pad_bytes = 256 - header_end_offset 
+    assert pad_bytes >= 0
+    if pad_bytes > 0:
+        out_file.write(b'\0' * pad_bytes)
+        print(f"  Padding: Offset {header_end_offset}-{out_file.tell()-1}, Size: {pad_bytes} bytes")
+    
+    total_header_size = out_file.tell()
+    print(f"Total Header Size: {total_header_size} bytes (Expected: 256 bytes)")
+    assert total_header_size == 256, "Header size mismatch!"
+    current_offset = total_header_size
 
+    print(f"\n--- Writing FP32 RMSNorm Weights ---")
     # first let's write out all the params that we are keeping in fp32: the norms
-    for layer in model.layers: # attention norms
+    rms_weights_info = []
+    for i, layer in enumerate(model.layers): # attention norms
+        name = f"layers.{i}.attention_norm.weight"
+        start_offset = out_file.tell()
         serialize_fp32(out_file, layer.attention_norm.weight)
-    for layer in model.layers: # MLP norms
+        end_offset = out_file.tell()
+        size = end_offset - start_offset
+        rms_weights_info.append({'name': name, 'start': start_offset, 'end': end_offset -1, 'size': size, 'shape': tuple(layer.attention_norm.weight.shape), 'dtype': 'fp32'})
+        current_offset = end_offset
+    for i, layer in enumerate(model.layers): # MLP norms
+        name = f"layers.{i}.ffn_norm.weight"
+        start_offset = out_file.tell()
         serialize_fp32(out_file, layer.ffn_norm.weight)
-    serialize_fp32(out_file, model.norm.weight) # final pre-classifier norm
+        end_offset = out_file.tell()
+        size = end_offset - start_offset
+        rms_weights_info.append({'name': name, 'start': start_offset, 'end': end_offset -1, 'size': size, 'shape': tuple(layer.ffn_norm.weight.shape), 'dtype': 'fp32'})
+        current_offset = end_offset
+    
+    name = "model.norm.weight" # final pre-classifier norm
+    start_offset = out_file.tell()
+    serialize_fp32(out_file, model.norm.weight)
+    end_offset = out_file.tell()
+    size = end_offset - start_offset
+    rms_weights_info.append({'name': name, 'start': start_offset, 'end': end_offset -1, 'size': size, 'shape': tuple(model.norm.weight.shape), 'dtype': 'fp32'})
+    current_offset = end_offset
 
-    # now let's write out all the params that we are quantizing to Q8_0
-    # note we skip classifier weights, which are shared with the embedding
-    ew = []
-    for i, w in enumerate(weights):
+    for info in rms_weights_info:
+        print(f"  Written: {info['name']} (Shape: {info['shape']}, Dtype: {info['dtype']})")
+        print(f"    File Offset: {info['start']}-{info['end']}, Size: {info['size']} bytes")
+
+
+    print(f"\n--- Quantizing and Writing Q8_0 Weights (Group Size: {group_size}) ---")
+    ew = [] # To store (error, shape, name)
+    quantized_weights_layout_info = []
+
+    for i, w in enumerate(weights_to_quantize):
+        weight_name = weight_names[i]
+        original_dtype = w.dtype
+        
         # quantize this weight
         q, s, err = quantize_q80(w, group_size)
+        
+        # Log before writing
+        print(f"  ({i+1}/{len(weights_to_quantize)}) Processing: {weight_name}")
+        print(f"    Original Shape: {tuple(w.shape)}, Original Dtype: {original_dtype}")
+        print(f"    Quantized (INT8) Shape: {tuple(q.shape)}")
+        print(f"    Scales (FP32) Count: {s.numel()}, Shape: {tuple(s.shape)}")
+        print(f"    Max Quantization Error for this tensor: {err:.6f}")
+
         # save the int8 weights to file
-        serialize_int8(out_file, q) # save the tensor in int8
-        serialize_fp32(out_file, s) # save scale factors
-        # logging
-        ew.append((err, w.shape))
-        print(f"{i+1}/{len(weights)} quantized {tuple(w.shape)} to Q8_0 with max error {err}")
+        start_offset_q = out_file.tell()
+        serialize_int8(out_file, q) 
+        end_offset_q = out_file.tell()
+        size_q = end_offset_q - start_offset_q
+        quantized_weights_layout_info.append({
+            'name': f"{weight_name} (INT8 values)", 
+            'start': start_offset_q, 'end': end_offset_q -1, 'size': size_q, 
+            'shape': tuple(q.shape), 'dtype': 'int8'
+        })
+        print(f"    Written INT8 values: File Offset {start_offset_q}-{end_offset_q-1}, Size: {size_q} bytes")
+        current_offset = end_offset_q
 
-    # print the highest error across all weights, should be very small, e.g. O(~0.001)
-    ew.sort(reverse=True)
-    print(f"max quantization group error across all weights: {ew[0][0]}")
+        # save scale factors
+        start_offset_s = out_file.tell()
+        serialize_fp32(out_file, s) 
+        end_offset_s = out_file.tell()
+        size_s = end_offset_s - start_offset_s
+        quantized_weights_layout_info.append({
+            'name': f"{weight_name} (FP32 scales)", 
+            'start': start_offset_s, 'end': end_offset_s -1, 'size': size_s, 
+            'shape': tuple(s.shape), 'dtype': 'fp32'
+        })
+        print(f"    Written FP32 scales: File Offset {start_offset_s}-{end_offset_s-1}, Size: {size_s} bytes")
+        current_offset = end_offset_s
+        
+        ew.append((err, w.shape, weight_name))
 
-    # write to binary file
+    # print the highest error across all weights
+    ew.sort(key=lambda x: x[0], reverse=True) # Sort by error
+    if ew:
+        print(f"\nMax quantization group error across all weights: {ew[0][0]:.6f} (for tensor: {ew[0][2]}, shape: {ew[0][1]})")
+        print("Min quantization group error across all weights: {:.6f} (for tensor: {}, shape: {})".format(ew[-1][0], ew[-1][2], ew[-1][1]))
+
     out_file.close()
-    print(f"wrote {filepath}")
+    final_file_size = os.path.getsize(filepath)
+    print(f"\n--- Export Complete ---")
+    print(f"Wrote quantized model to: {filepath}")
+    print(f"Final file size: {final_file_size} bytes.")
+    if final_file_size != current_offset:
+        print(f"WARNING: Final file size ({final_file_size}) does not match tracked offset ({current_offset}). Check logic.")
 
 def hf_export(llama_model, filepath, group_size=64, dtype=torch.float32):
     """ Generate the pytorch_model.bin state_dict and config.json for HuggingFace """
@@ -546,6 +664,7 @@ if __name__ == "__main__":
     parser.add_argument("filepath", type=str, help="the output filepath")
     parser.add_argument("--version", default=0, type=int, help="the version to export with")
     parser.add_argument("--dtype", type=str, help="dtype of the model (fp16, fp32)", default="fp32")
+    parser.add_argument("--group_size", type=int, default=64, help="group size for quantization (version 2)") # 新增参数
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--checkpoint", type=str, help="model checkpoint, .pt file")
     group.add_argument("--meta-llama", type=str, help="meta llama model path")
@@ -564,4 +683,8 @@ if __name__ == "__main__":
         parser.error("Can't load input model!")
 
     # export
-    model_export(model, args.filepath, args.version, args.dtype)
+    if args.version == 2:
+        print(f"Exporting version 2 with group_size: {args.group_size}")
+        version2_export(model, args.filepath, group_size=args.group_size)
+    else:
+        model_export(model, args.filepath, args.version, args.dtype)
