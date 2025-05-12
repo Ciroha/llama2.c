@@ -546,6 +546,7 @@ if __name__ == "__main__":
     parser.add_argument("filepath", type=str, help="the output filepath")
     parser.add_argument("--version", default=0, type=int, help="the version to export with")
     parser.add_argument("--dtype", type=str, help="dtype of the model (fp16, fp32)", default="fp32")
+    parser.add_argument("--group_size", type=int, default=64, help="group size for quantization (version 2)") # 新增参数
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--checkpoint", type=str, help="model checkpoint, .pt file")
     group.add_argument("--meta-llama", type=str, help="meta llama model path")
@@ -564,4 +565,8 @@ if __name__ == "__main__":
         parser.error("Can't load input model!")
 
     # export
-    model_export(model, args.filepath, args.version, args.dtype)
+    if args.version == 2:
+        print(f"Exporting version 2 with group_size: {args.group_size}")
+        version2_export(model, args.filepath, group_size=args.group_size)
+    else:
+        model_export(model, args.filepath, args.version, args.dtype) # 保留旧的调用方式给其他版本
